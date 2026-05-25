@@ -323,7 +323,8 @@ function switchTab(n){
   if(n!=='scan') stopScanner();
 }
 
-// ── SCANNER ────────────────────────────────────────────
+// ── SCANNER (enhanced for screen-displayed QR codes) ──
+// ── SCANNER (enhanced for screen-displayed QR codes) ──
 async function toggleScanner(){
   if(scannerOn){ stopScanner(); return; }
   if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){
@@ -332,12 +333,25 @@ async function toggleScanner(){
     return;
   }
   try{
-    // Try rear camera first, fall back to any
     let stream;
+    // Try high-res rear camera first for better QR reading
     try{
-      stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{exact:'environment'}}});
+      stream=await navigator.mediaDevices.getUserMedia({
+        video:{
+          facingMode:{exact:'environment'},
+          width:{ideal:1920},
+          height:{ideal:1080},
+          focusMode:'continuous'
+        }
+      });
     }catch(e){
-      stream=await navigator.mediaDevices.getUserMedia({video:true});
+      try{
+        stream=await navigator.mediaDevices.getUserMedia({
+          video:{facingMode:'environment',width:{ideal:1280},height:{ideal:720}}
+        });
+      }catch(e2){
+        stream=await navigator.mediaDevices.getUserMedia({video:true});
+      }
     }
     scannerStream=stream;
     const v=document.getElementById('video');
@@ -352,6 +366,96 @@ async function toggleScanner(){
     scannerOn=true;
     scanLoop=requestAnimationFrame(scanFrame);
   }catch(err){
+    let msg='Camera error';
+    if(err.name==='NotAllowedError') msg='Permission denied — allow camera in browser settings';
+    else if(err.name==='NotFoundError') msg='No camera found on this device';
+    else if(err.name==='NotReadableError') msg='Camera in use by another app — close it and retry';
+    else msg=err.message;
+    showToast(msg,'error');
+    document.getElementById('perm-hint').style.display='block';
+  }
+}
+
+function stopScanner(){
+  if(!scannerOn)return;
+  scannerOn=false;
+  cancelAnimationFrame(scanLoop);
+  if(scannerStream){scannerStream.getTracks().forEach(t=>t.stop());scannerStream=null;}
+  document.getElementById('scanner-wrap').style.display='none';
+  const b=document.getElementById('btn-scan');
+  b.classList.remove('scanning');
+  b.innerHTML=`<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg> Open QR Scanner`;
+}
+
+let lastScanAttempt=0;
+function scanFrame(){
+  if(!scannerOn)return;
+  const now=Date.now();
+  // Throttle to every 200ms for performance
+  if(now-lastScanAttempt < 200){ scanLoop=requestAnimationFrame(scanFrame); return; }
+  lastScanAttempt=now;
+
+  const v=document.getElementById('video'),c=document.getElementById('canvas');
+  if(v.readyState!==v.HAVE_ENOUGH_DATA){ scanLoop=requestAnimationFrame(scanFrame); return; }
+
+  const vw=v.videoWidth, vh=v.videoHeight;
+  if(!vw||!vh){ scanLoop=requestAnimationFrame(scanFrame); return; }
+
+  // Try multiple strategies to detect QR from screens
+  const ctx=c.getContext('2d',{willReadFrequently:true});
+
+  // Strategy 1: Full frame at native resolution
+  c.width=vw; c.height=vh;
+  ctx.drawImage(v,0,0);
+  let qr=tryDecode(ctx,c.width,c.height);
+  if(qr){ handleScan(qr); return; }
+
+  // Strategy 2: Center crop (where user aims the frame)
+  const cropSize=Math.min(vw,vh)*0.6;
+  const cx=(vw-cropSize)/2, cy=(vh-cropSize)/2;
+  c.width=300; c.height=300;
+  ctx.drawImage(v, cx,cy,cropSize,cropSize, 0,0,300,300);
+  qr=tryDecode(ctx,300,300);
+  if(qr){ handleScan(qr); return; }
+
+  // Strategy 3: Contrast boost — helps with screen glare
+  c.width=vw; c.height=vh;
+  ctx.drawImage(v,0,0);
+  ctx.filter='contrast(1.5) brightness(1.1)';
+  ctx.drawImage(v,0,0);
+  ctx.filter='none';
+  qr=tryDecode(ctx,c.width,c.height);
+  if(qr){ handleScan(qr); return; }
+
+  // Strategy 4: Inverted colours (for dark background QR codes)
+  c.width=300; c.height=300;
+  ctx.drawImage(v, cx,cy,cropSize,cropSize, 0,0,300,300);
+  const imgData=ctx.getImageData(0,0,300,300);
+  for(let i=0;i<imgData.data.length;i+=4){
+    imgData.data[i]=255-imgData.data[i];
+    imgData.data[i+1]=255-imgData.data[i+1];
+    imgData.data[i+2]=255-imgData.data[i+2];
+  }
+  ctx.putImageData(imgData,0,0);
+  qr=tryDecode(ctx,300,300);
+  if(qr){ handleScan(qr); return; }
+
+  scanLoop=requestAnimationFrame(scanFrame);
+}
+
+function tryDecode(ctx,w,h){
+  const imgData=ctx.getImageData(0,0,w,h);
+  // Try both inversion modes
+  let result=jsQR(imgData.data,w,h,{inversionAttempts:'attemptBoth'});
+  return result&&result.data ? result.data : null;
+}
+
+function handleScan(data){
+  // Visual + audio feedback
+  if(window.navigator.vibrate) window.navigator.vibrate([100,50,100]);
+  stopScanner();
+  lookupCode(data);
+}catch(err){
     let msg='Camera error';
     if(err.name==='NotAllowedError') msg='Permission denied — allow camera in browser settings';
     else if(err.name==='NotFoundError') msg='No camera found on this device';
